@@ -21,7 +21,7 @@ logger = logging.getLogger("clash_config_generator_gui")
 
 # 设置页面配置
 st.set_page_config(
-    page_title="Clash Configurator Pro",
+    page_title="Create Clash Yaml",
     page_icon="🚀",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -308,7 +308,7 @@ def display_proxy_details(proxy):
 def main():
     """Streamlit应用主函数"""
     
-    st.title("Clash Configurator Pro")
+    st.title("Create Clash Yaml")
     st.markdown("一个基于模板的、现代化的Clash配置文件生成工具。" )
 
     # --- 主布局 ---
