@@ -1,14 +1,12 @@
 import requests
-import base64
 import json
 import yaml
 import re
 import logging
 import random
 import time
-from urllib.parse import urlparse, unquote
-from . import utils
-from .utils import decode_base64, safe_load_yaml, parse_uri
+from urllib.parse import unquote
+from .utils import decode_base64, is_base64
 from .node_parser import NodeParser
 
 logger = logging.getLogger(__name__)
@@ -58,8 +56,10 @@ class SubscriptionManager:
                 response = requests.get(url, headers=headers, timeout=self.timeout)
                 
                 if response.status_code == 200:
-                    logger.info(f"成功获取订阅，内容长度: {len(response.text)} 字节")
-                    return response.text
+                    # 强制使用UTF-8解码,避免requests自动编码检测错误导致乱码
+                    content = response.content.decode('utf-8', errors='replace')
+                    logger.info(f"成功获取订阅，内容长度: {len(content)} 字节")
+                    return content
                 else:
                     logger.warning(f"获取订阅失败，状态码: {response.status_code}")
             except requests.exceptions.Timeout:
@@ -73,19 +73,73 @@ class SubscriptionManager:
         
         logger.error(f"获取订阅失败，已达到最大重试次数 ({self.max_retries})")
         return None
-    
+
+    def _sanitize_content(self, content):
+        """
+        清理内容中可能导致YAML解析失败的特殊Unicode字符
+
+        Args:
+            content (str): 原始内容
+
+        Returns:
+            str: 清理后的内容
+        """
+        if not content:
+            return content
+
+        # 需要移除的Unicode字符范围:
+        # - 0xFE00-0xFE0F: 变体选择器(Variation Selectors)
+        # - 0x200B-0x200D: 零宽字符(Zero Width characters)
+        # - 0x009A: 单字符导入(Single Character Introducer)
+        # - 0x0080-0x009F: C1控制字符
+        # - 0xFEFF: 零宽不换行空格(BOM)
+
+        import unicodedata
+
+        # 定义需要过滤的字符集
+        def should_keep_char(char):
+            code = ord(char)
+            # 过滤变体选择器
+            if 0xFE00 <= code <= 0xFE0F:
+                return False
+            # 过滤零宽字符
+            if 0x200B <= code <= 0x200D:
+                return False
+            # 过滤C1控制字符(保留换行符、制表符、回车符)
+            if 0x0080 <= code <= 0x009F:
+                return False
+            # 过滤BOM
+            if code == 0xFEFF:
+                return False
+            return True
+
+        try:
+            # 过滤特殊字符
+            cleaned = ''.join(char for char in content if should_keep_char(char))
+            removed_count = len(content) - len(cleaned)
+            if removed_count > 0:
+                logger.info(f"清理了 {removed_count} 个特殊Unicode字符")
+            return cleaned
+        except Exception as e:
+            logger.warning(f"清理内容时出错: {str(e)}, 使用原始内容")
+            return content
+
     def parse_subscription(self, content):
         """
         解析订阅内容
-        
+
         Args:
             content (str): 订阅内容
-            
+
         Returns:
             list: 解析后的节点列表
         """
         logger.info(f"开始解析订阅内容，长度: {len(content)}")
-        
+
+        # 清理可能导致YAML解析失败的特殊Unicode字符
+        # 包括:变体选择器、零宽字符、其他控制字符等
+        content = self._sanitize_content(content)
+
         # 尝试先按yaml/json加载
         if content.strip().startswith('{') or content.strip().startswith('[') or 'proxies:' in content:
             try:
@@ -122,10 +176,10 @@ class SubscriptionManager:
                 logger.warning(f"解析YAML/JSON时出错: {str(e)}")
         
         # 检测是否是base64编码
-        if utils.is_base64(content):
+        if is_base64(content):
             logger.info("检测到BASE64编码，尝试解码")
             try:
-                decoded = utils.decode_base64(content)
+                decoded = decode_base64(content)
                 return self._parse_decoded_content(decoded)
             except Exception as e:
                 logger.warning(f"BASE64解码失败: {str(e)}")

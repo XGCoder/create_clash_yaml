@@ -4,21 +4,16 @@
 import streamlit as st
 import logging
 import os
-import io
-import json
 import glob
-import base64
 import re
-from datetime import datetime
-from tempfile import NamedTemporaryFile
-from pathlib import Path
-from io import StringIO
+import yaml
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse
 
 # 从包导入所需的组件
 from clash_config_generator.config_generator import ClashConfigGenerator
 from clash_config_generator.subscription import SubscriptionManager
-from clash_config_generator.node_parser import NodeParser, parse_proxy
-from clash_config_generator.utils import load_local_file
+from clash_config_generator.node_parser import parse_proxy
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -26,775 +21,531 @@ logger = logging.getLogger("clash_config_generator_gui")
 
 # 设置页面配置
 st.set_page_config(
-    page_title="Clash Config Generator",
+    page_title="Clash Configurator Pro",
     page_icon="🚀",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# 定义配置预设目录和文件格式
-CONFIG_DIR = "local_configs"
-if not os.path.exists(CONFIG_DIR):
-    os.makedirs(CONFIG_DIR)
+# --- Session State Initialization ---
+states = {
+    'subscription_urls': "",
+    'selected_template': None,
+    'custom_template_content': None,
+    'nodes_loaded': False,
+    'all_proxies': [],
+    'proxies_by_source': {},
+    'enable_port_mapping': False,
+    'node_mappings': {},
+    'start_mapping_port': 42001,
+    'source_all_selected': {},
+    'port_mapping_confirmed': False,
+}
+for key, value in states.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
-def get_download_link(file_path, file_name):
+def get_template_files():
+    """获取项目根目录下的所有YAML模板文件。"""
+    return glob.glob("*.yaml")
+
+def update_node_ports():
+    """当起始端口改变时，更新所有节点的端口映射。"""
+    start_port = st.session_state.start_mapping_port
+    if 'all_proxies' in st.session_state and 'node_mappings' in st.session_state:
+        for i, proxy in enumerate(st.session_state.all_proxies):
+            if proxy['name'] in st.session_state.node_mappings:
+                st.session_state.node_mappings[proxy['name']]['port'] = start_port + i
+
+def toggle_all_nodes(source_key, proxies):
+    """切换一个源的所有节点的启用状态。"""
+    is_checked = st.session_state[f"all_{source_key}"]
+    for p in proxies:
+        node_name = p['name']
+        if node_name in st.session_state.node_mappings:
+            # 更新 node_mappings 中的状态
+            st.session_state.node_mappings[node_name]['enabled'] = is_checked
+            # 同步更新单个checkbox的session state key
+            checkbox_key = f"enable_{node_name}"
+            st.session_state[checkbox_key] = is_checked
+
+def validate_port_unique(node_name, new_port):
     """
-    生成一个文件下载链接
-    
+    验证端口是否唯一（仅检查已启用的节点）
+
     Args:
-        file_path (str): 文件路径
-        file_name (str): 下载时使用的文件名
-        
-    Returns:
-        str: HTML格式的下载链接
-    """
-    with open(file_path, 'r', encoding='utf-8') as f:
-        data = f.read()
-    
-    b64 = base64.b64encode(data.encode()).decode()
-    href = f'<a href="data:file/yaml;base64,{b64}" download="{file_name}">点击下载配置文件</a>'
-    return href
+        node_name (str): 当前节点名称
+        new_port (int): 要设置的新端口
 
-def save_config_preset(name, data):
-    """
-    保存配置预设到本地文件
-    
-    Args:
-        name (str): 预设名称，如果为None则使用日期格式
-        data (dict): 预设数据
-        
     Returns:
-        str: 保存的文件名
+        tuple: (是否唯一, 冲突的节点名或None)
     """
-    if not name:
-        name = f"local_config_{datetime.now().strftime('%y-%m-%d')}"
-    
-    # 确保文件名不含非法字符
-    name = "".join(c for c in name if c.isalnum() or c in "-_.")
-    
-    file_path = os.path.join(CONFIG_DIR, f"{name}.json")
-    with open(file_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    
-    logger.info(f"配置预设已保存: {file_path}")
-    return name
+    for name, mapping in st.session_state.node_mappings.items():
+        if name != node_name and mapping.get('enabled') and mapping.get('port') == new_port:
+            return False, name
+    return True, None
 
-def load_config_preset(name):
+def on_port_change():
     """
-    加载本地配置预设
-    
-    Args:
-        name (str): 预设名称
-        
-    Returns:
-        dict: 预设数据，如果加载失败则返回None
+    端口输入框的 on_change 回调
+    当用户修改任何端口时，自动取消「确认端口映射」状态
     """
-    file_path = os.path.join(CONFIG_DIR, f"{name}.json")
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        logger.info(f"配置预设已加载: {file_path}")
-        return data
-    except Exception as e:
-        logger.error(f"加载配置预设失败: {str(e)}")
-        return None
+    if st.session_state.get('port_mapping_confirmed', False):
+        st.session_state.port_mapping_confirmed = False
+        logger.info("端口已修改，已自动取消「确认端口映射」状态")
 
-def delete_config_preset(name):
+def validate_and_confirm_ports():
     """
-    删除本地配置预设
-    
-    Args:
-        name (str): 预设名称
-        
-    Returns:
-        bool: 是否成功删除
-    """
-    file_path = os.path.join(CONFIG_DIR, f"{name}.json")
-    try:
-        os.remove(file_path)
-        logger.info(f"配置预设已删除: {file_path}")
-        return True
-    except Exception as e:
-        logger.error(f"删除配置预设失败: {str(e)}")
-        return False
+    验证并确认所有端口映射的回调函数
+    当用户勾选「确认端口映射」复选框时触发
 
-def get_config_presets():
+    验证所有已启用节点的端口冲突：
+    - 无冲突：保持勾选状态
+    - 有冲突：强制取消勾选，显示错误提示
     """
-    获取所有本地配置预设
-    
+    is_checked = st.session_state.get('port_mapping_confirmed', False)
+
+    if not is_checked:
+        # 用户取消勾选，无需验证
+        logger.info("用户取消了端口映射确认")
+        return
+
+    # 用户勾选，先同步所有端口输入框的值到 node_mappings
+    logger.info("开始同步端口值到 node_mappings...")
+    for node_name, mapping in st.session_state.node_mappings.items():
+        if mapping.get('enabled'):
+            port_input_key = f"port_{node_name}"
+            if port_input_key in st.session_state:
+                # 获取用户输入的端口值
+                new_port = st.session_state[port_input_key]
+                # 同步到 node_mappings
+                st.session_state.node_mappings[node_name]['port'] = new_port
+                logger.debug(f"节点 '{node_name}' 端口同步: {mapping.get('port')} -> {new_port}")
+
+    # 开始验证
+    has_conflicts, conflicts = check_port_conflicts()
+
+    if has_conflicts:
+        # 有冲突，强制取消勾选
+        st.session_state.port_mapping_confirmed = False
+
+        # 显示详细的冲突信息
+        conflict_details = []
+        for port, nodes in conflicts:
+            conflict_details.append(f"端口 {port}: {', '.join([n[:20] + '...' if len(n) > 20 else n for n in nodes])}")
+
+        error_msg = f"❌ 端口验证失败！检测到 {len(conflicts)} 个端口冲突：\n" + "\n".join(conflict_details)
+        st.toast(error_msg, icon="❌")
+        logger.error(f"端口映射确认失败: 存在 {len(conflicts)} 个端口冲突")
+        st.rerun()
+    else:
+        # 无冲突，保持勾选
+        enabled_count = sum(1 for m in st.session_state.node_mappings.values() if m.get('enabled'))
+        st.toast(f"✅ 端口验证通过！所有 {enabled_count} 个端口均无冲突")
+        logger.info(f"端口映射确认成功: 所有 {enabled_count} 个端口均无冲突")
+
+def auto_fix_port_conflicts():
+    """
+    自动修正所有端口冲突
+    从起始端口开始，为所有启用的节点重新分配不冲突的端口
+    """
+    if 'node_mappings' not in st.session_state:
+        return
+
+    start_port = st.session_state.get('start_mapping_port', 42001)
+    enabled_nodes = [(name, mapping) for name, mapping in st.session_state.node_mappings.items() if mapping.get('enabled')]
+
+    # 按原有端口排序，保持相对顺序
+    enabled_nodes.sort(key=lambda x: x[1].get('port', 0))
+
+    # 重新分配端口
+    current_port = start_port
+    for name, mapping in enabled_nodes:
+        st.session_state.node_mappings[name]['port'] = current_port
+        current_port += 1
+
+    logger.info(f"自动修正端口冲突完成，共分配 {len(enabled_nodes)} 个端口")
+
+def check_port_conflicts():
+    """
+    检查当前所有启用节点的端口冲突
+
     Returns:
-        list: 预设名称列表
+        tuple: (是否有冲突, 冲突列表)
+        冲突列表格式: [(端口号, [节点名1, 节点名2, ...])]
     """
-    presets = []
-    for file_path in glob.glob(os.path.join(CONFIG_DIR, "*.json")):
-        name = os.path.basename(file_path).replace(".json", "")
-        presets.append(name)
-    return sorted(presets, reverse=True)  # 最新的排在前面
+    port_usage = {}
+    for name, mapping in st.session_state.node_mappings.items():
+        if mapping.get('enabled'):
+            port = mapping.get('port')
+            if port not in port_usage:
+                port_usage[port] = []
+            port_usage[port].append(name)
+
+    conflicts = [(port, nodes) for port, nodes in port_usage.items() if len(nodes) > 1]
+    return len(conflicts) > 0, conflicts
+
+def add_multiple_nodes():
+    """
+    从文本区域解析一个或多个节点URI并将其添加到会话状态。
+    """
+    uris = st.session_state.get("multiple_node_uris", "")
+    if not uris.strip():
+        st.toast("⚠️ 请输入至少一个节点URI。" )
+        return
+
+    uris_list = [uri.strip() for uri in uris.splitlines() if uri.strip()]
+    
+    successful_count = 0
+    failed_count = 0
+    
+    manual_source_name = "手动添加"
+
+    # 确保核心 state keys 存在
+    if 'all_proxies' not in st.session_state:
+        st.session_state.all_proxies = []
+    if 'proxies_by_source' not in st.session_state:
+        st.session_state.proxies_by_source = {}
+    if manual_source_name not in st.session_state.proxies_by_source:
+        st.session_state.proxies_by_source[manual_source_name] = []
+    if 'node_mappings' not in st.session_state:
+        st.session_state.node_mappings = {}
+
+    with st.spinner(f"正在解析和添加 {len(uris_list)} 个节点..."):
+        for uri in uris_list:
+            try:
+                node = parse_proxy(uri)
+                if node:
+                    # 检查节点是否已存在
+                    if any(p['name'] == node['name'] for p in st.session_state.all_proxies):
+                        logger.warning(f"节点 '{node['name']}' 已存在，跳过添加。" )
+                        failed_count += 1
+                        continue
+
+                    node['_source'] = manual_source_name
+                    
+                    st.session_state.all_proxies.append(node)
+                    st.session_state.proxies_by_source[manual_source_name].append(node)
+                    
+                    # 为新节点添加映射
+                    port = st.session_state.start_mapping_port + len(st.session_state.all_proxies) - 1
+                    st.session_state.node_mappings[node['name']] = {"enabled": False, "port": port}
+                    
+                    successful_count += 1
+                else:
+                    logger.error(f"无法解析URI: {uri}")
+                    failed_count += 1
+            except Exception as e:
+                logger.error(f"处理URI时出错 '{uri}': {e}")
+                failed_count += 1
+
+    # 显示结果
+    if successful_count > 0:
+        st.toast(f"✅ 成功添加 {successful_count} 个节点。" )
+        st.session_state.force_collapse = True
+    if failed_count > 0:
+        st.toast(f"❌ {failed_count} 个节点添加失败（可能已存在或格式错误）。" )
+
+    # 清理输入框
+    if successful_count > 0:
+        st.session_state.multiple_node_uris = ""
+
+def callback_load_nodes():
+    """
+    Callback function to load nodes from subscription URLs.
+    """
+    with st.spinner("正在从订阅链接加载节点..."):
+        # 先筛选出所有手动添加的节点并保留
+        manual_source_name = "手动添加"
+        existing_proxies = st.session_state.get('all_proxies', [])
+        all_proxies = [p for p in existing_proxies if p.get('_source') == manual_source_name]
+        
+        existing_sources = st.session_state.get('proxies_by_source', {})
+        proxies_by_source = {k: v for k, v in existing_sources.items() if k == manual_source_name}
+
+        sub_manager = SubscriptionManager()
+
+        if st.session_state.subscription_urls:
+            urls = [url.strip() for url in st.session_state.subscription_urls.split('\n') if url.strip()]
+            for url in urls:
+                proxies = sub_manager.fetch_and_parse(url)
+                if proxies:
+                    source_name = urlparse(url).netloc
+                    # Always replace (not extend) to avoid accumulating old proxies
+                    proxies_by_source[source_name] = proxies
+
+        # Rebuild all_proxies from scratch by combining all sources
+        # This ensures no accumulation when reloading
+        for source_proxies in proxies_by_source.values():
+            all_proxies.extend(source_proxies)
+        
+        st.session_state.all_proxies = all_proxies
+        st.session_state.proxies_by_source = proxies_by_source
+        st.session_state.nodes_loaded = True
+        
+        old_mappings = st.session_state.get('node_mappings', {})
+        new_mappings = {}
+        port = st.session_state.start_mapping_port
+        for proxy in all_proxies:
+            proxy_name = proxy['name']
+            if proxy_name in old_mappings:
+                new_mappings[proxy_name] = {
+                    "enabled": old_mappings[proxy_name].get('enabled', False),
+                    "port": port
+                }
+            else:
+                new_mappings[proxy_name] = {"enabled": False, "port": port}
+            port += 1
+        st.session_state.node_mappings = new_mappings
+        st.session_state.force_collapse = True
+
+def display_proxy_details(proxy):
+    """Displays the details of a proxy node in a YAML format, excluding internal keys."""
+    details_to_show = proxy.copy()
+    details_to_show.pop('_source', None) # Safely remove the internal key
+    st.code(yaml.dump(details_to_show, allow_unicode=True, sort_keys=False), language='yaml')
 
 def main():
     """Streamlit应用主函数"""
     
-    st.title("Clash 配置生成器")
-    st.markdown("使用此工具可以合并多个订阅源和直连节点，生成 Clash Verge 配置文件。")
-    
-    # 添加全局CSS样式
-    st.markdown("""
-    <style>
-    .node-cell {
-        display: flex;
-        align-items: center;
-        min-height: 40px;
-    }
-    .stExpander {
-        border: 1px solid #f0f2f6;
-        border-radius: 4px;
-        margin-bottom: 10px;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-    
-    # 检查会话状态中是否存在必要的变量
-    if 'subscriptions' not in st.session_state:
-        st.session_state.subscriptions = []
-    
-    if 'all_proxies' not in st.session_state:
-        st.session_state.all_proxies = []
-    
-    if 'nodes_loaded' not in st.session_state:
-        st.session_state.nodes_loaded = False
-    
-    if 'enable_port_mapping' not in st.session_state:
-        st.session_state.enable_port_mapping = False
-    
-    if 'node_mappings' not in st.session_state:
-        st.session_state.node_mappings = {}
-    
-    if 'start_mapping_port' not in st.session_state:
-        st.session_state.start_mapping_port = 42000
-    
-    if 'proxies_by_source' not in st.session_state:
-        st.session_state.proxies_by_source = {}
-    
-    if 'template_path' not in st.session_state:
-        st.session_state.template_path = None
-    
-    # 用于存储来源节点全选状态的会话变量
-    if 'source_all_selected' not in st.session_state:
-        st.session_state.source_all_selected = {}
-    
-    # 用于折叠日志的会话变量
-    if 'mapping_log_expanded' not in st.session_state:
-        st.session_state.mapping_log_expanded = False
-    
-    if 'config_log_expanded' not in st.session_state:
-        st.session_state.config_log_expanded = False
+    st.title("Clash Configurator Pro")
+    st.markdown("一个基于模板的、现代化的Clash配置文件生成工具。" )
 
-    # 用于存储表单数据的会话状态
-    if 'subscription_urls' not in st.session_state:
-        st.session_state.subscription_urls = ""
-    if 'direct_nodes' not in st.session_state:
-        st.session_state.direct_nodes = ""
-    if 'port' not in st.session_state:
-        st.session_state.port = 7890
-    if 'mixed_port' not in st.session_state:
-        st.session_state.mixed_port = 7891
-    if 'default_port' not in st.session_state:
-        st.session_state.default_port = 7897
-    if 'default_node' not in st.session_state:
-        st.session_state.default_node = ""
-    if 'output_file' not in st.session_state:
-        st.session_state.output_file = "config.yaml"
-    
-    # 侧边栏设置
-    with st.sidebar:
-        st.header("配置选项")
-        
-        # 配置管理部分
-        st.subheader("配置管理")
-        
-        # 获取可用的配置预设
-        presets = get_config_presets()
-        
-        # 选择预设
-        selected_preset = st.selectbox(
-            "加载预设配置",
-            [""] + presets,
-            index=0,
-            help="选择之前保存的配置预设"
-        )
-        
-        # 加载预设按钮
-        if selected_preset and st.button("加载选中的预设"):
-            preset_data = load_config_preset(selected_preset)
-            if preset_data:
-                # 更新会话状态
-                for key, value in preset_data.items():
-                    if key in st.session_state:
-                        st.session_state[key] = value
-                st.success(f"已加载预设: {selected_preset}")
-                st.experimental_rerun()
-            else:
-                st.error("加载预设失败")
-        
-        # 保存当前配置为预设
-        st.markdown("---")
-        preset_name = st.text_input("预设名称", value="", help="留空则使用日期格式自动命名")
-        
-        if st.button("保存当前配置为预设"):
-            # 收集当前配置
-            current_config = {
-                'subscription_urls': st.session_state.subscription_urls,
-                'direct_nodes': st.session_state.direct_nodes,
-                'port': st.session_state.port,
-                'mixed_port': st.session_state.mixed_port,
-                'enable_port_mapping': st.session_state.enable_port_mapping,
-                'default_port': st.session_state.default_port,
-                'start_mapping_port': st.session_state.start_mapping_port,
-                'default_node': st.session_state.default_node,
-                'output_file': st.session_state.output_file,
-                'listener_type': st.session_state.listener_type if 'listener_type' in st.session_state else 'mixed'
-            }
+    # --- 主布局 ---
+    col1, col2, col3 = st.columns([3, 5, 2.8])
+
+    # --- Column 1: Inputs ---
+    with col1:
+        st.header("📥 输入源")
+        with st.container(border=True):
+            st.subheader("① 选择或上传模板")
+            template_files = get_template_files()
+            if not template_files and not st.session_state.custom_template_content:
+                st.error("错误：项目根目录下未找到任何.yaml模板文件。请添加一个或上传一个模板。" )
+
+            if st.session_state.selected_template is None and template_files:
+                preferred_template = next((t for t in template_files if 'qishiyu' in t), template_files[0])
+                st.session_state.selected_template = preferred_template
+
+            st.selectbox("选择一个预设模板", options=template_files, key='selected_template')
             
-            # 保存配置预设
-            saved_name = save_config_preset(preset_name, current_config)
-            st.success(f"已保存预设: {saved_name}")
-            # 刷新页面以更新预设列表
-            st.experimental_rerun()
-        
-        # 删除预设
-        if presets and st.button("删除选中的预设"):
-            if selected_preset:
-                if delete_config_preset(selected_preset):
-                    st.success(f"已删除预设: {selected_preset}")
-                    # 刷新页面以更新预设列表
-                    st.experimental_rerun()
-                else:
-                    st.error("删除预设失败")
-            else:
-                st.warning("请先选择一个预设")
-        
-        st.markdown("---")
-        
-        # 基本端口设置
-        st.subheader("基本端口设置")
-        port = st.number_input("HTTP代理端口", value=st.session_state.port, min_value=1, max_value=65535)
-        mixed_port = st.number_input("混合代理端口", value=st.session_state.mixed_port, min_value=1, max_value=65535)
-        
-        # 模板文件选择
-        st.subheader("规则模板设置")
-        template_file = st.file_uploader(
-            "选择规则模板文件", 
-            type=["yaml", "yml"],
-            help="上传包含代理组和规则的YAML模板文件，如果不上传将使用默认模板"
-        )
-        
-        if template_file is not None:
-            # 保存上传的模板文件
-            template_path = os.path.join(os.path.dirname(__file__), "template.yaml")
-            with open(template_path, "wb") as f:
-                f.write(template_file.getvalue())
-            st.session_state.template_path = template_path
-            st.success(f"成功加载模板文件: {template_file.name}")
-        
-        # 端口映射设置
-        st.subheader("端口映射设置")
-        enable_port_mapping = st.checkbox("启用端口映射", value=st.session_state.enable_port_mapping, help="为选定节点分配特定端口")
-        
-        # 更新会话状态
-        st.session_state.enable_port_mapping = enable_port_mapping
-        
-        # 设置映射起始端口和监听器类型
-        if enable_port_mapping:
-            st.session_state.start_mapping_port = st.number_input(
-                "端口映射起始值",
-                value=st.session_state.start_mapping_port,
-                min_value=1025,
-                max_value=65000,
-                help="建议的节点端口映射起始值，可在配置端口映射时修改")
-            
-            # 添加监听器类型选择
-            listener_type_options = ["mixed", "socks", "http"]
-            listener_type_index = 0  # 默认选择 mixed
-            
-            if 'listener_type' in st.session_state:
-                try:
-                    listener_type_index = listener_type_options.index(st.session_state.listener_type)
-                except ValueError:
-                    listener_type_index = 0
-            
-            listener_type = st.selectbox(
-                "端口映射监听器类型",
-                listener_type_options,
-                index=listener_type_index,
-                help="mixed: 同时支持HTTP和SOCKS5, socks: 仅SOCKS5, http: 仅HTTP"
+            uploaded_file = st.file_uploader("或上传自定义模板", type=['yaml', 'yml'])
+            if uploaded_file:
+                st.session_state.custom_template_content = uploaded_file.getvalue().decode('utf-8')
+                st.success(f"已上传模板 '{uploaded_file.name}'")
+
+        with st.container(border=True):
+            st.subheader("② 输入订阅链接")
+            st.text_area("每个链接占一行", key="subscription_urls", height=150)
+
+        st.button("加载节点", type="primary", use_container_width=True, on_click=callback_load_nodes)
+
+        with st.container(border=True):
+            st.subheader("③ 添加手动节点")
+            st.text_area(
+                "输入单个或多个节点URI (每行一个)", 
+                key="multiple_node_uris", 
+                height=150,
+                placeholder="例如: vmess://...\nss://...\ntrojan://..."
             )
-            
-            # 更新会话状态
-            st.session_state.listener_type = listener_type
-            
-            # 添加端口映射的说明
-            st.info(f"端口映射将使您可以通过不同端口直接访问特定节点，无需通过规则选择。每个节点会创建一个{listener_type}类型监听器，{'同时支持HTTP和SOCKS5协议' if listener_type == 'mixed' else '仅支持SOCKS5协议' if listener_type == 'socks' else '仅支持HTTP协议'}。系统会自动为每个映射端口生成相应的分流规则，确保通过该端口的流量直接使用对应节点。您可以在加载节点后选择需要映射的节点和端口。")
-        else:
-            # 确保listener_type默认值存在
-            if 'listener_type' not in st.session_state:
-                st.session_state.listener_type = "mixed"
-        
-        # 文件名设置
-        st.subheader("输出设置")
-        output_file = st.text_input("配置文件名", value=st.session_state.output_file)
-        
-        # 更新会话状态
-        st.session_state.output_file = output_file
-        
-        # 关于信息
-        st.markdown("---")
-        st.markdown("### 关于")
-        st.markdown("Clash 配置生成器是一个用于合并多个代理订阅的工具。")
-        st.markdown("支持Vmess、Shadowsocks、Trojan和Hysteria等协议。")
-    
-    # 创建标签页
-    tab1, tab2, tab3 = st.tabs(["订阅链接", "直连节点", "配置生成"])
-    
-    # 订阅链接标签页
-    with tab1:
-        st.header("订阅链接")
-        st.markdown("添加一个或多个订阅链接，每行一个链接")
-        
-        subscription_urls = st.text_area(
-            "订阅链接 (每行一个)",
-            value=st.session_state.subscription_urls,
-            height=150,
-            help="输入Clash订阅链接，每行一个",
-        )
-        
-        # 更新会话状态
-        st.session_state.subscription_urls = subscription_urls
-    
-    # 直连节点标签页
-    with tab2:
-        st.header("直连节点")
-        st.markdown("添加直连节点，支持vmess://、ss://、trojan://等格式")
-        
-        direct_nodes = st.text_area(
-            "直连节点 (每行一个)",
-            value=st.session_state.direct_nodes,
-            height=150,
-            help="输入节点链接，每行一个，支持vmess://、ss://、trojan://等格式",
-        )
-        
-        # 更新会话状态
-        st.session_state.direct_nodes = direct_nodes
-        
-        uploaded_file = st.file_uploader(
-            "或者上传包含节点的文件",
-            help="上传包含节点链接的文本文件，每行一个节点",
-        )
-    
-    # 配置生成标签页
-    with tab3:
-        st.header("配置生成")
-        
-        # 添加加载节点按钮
-        if st.button("加载节点", help="获取所有节点但不立即生成配置，可用于配置端口映射"):
-            with st.spinner("正在加载节点..."):
-                try:
-                    # 初始化组件
-                    sub_manager = SubscriptionManager()
-                    node_parser = NodeParser()
-                    
-                    # 收集所有节点
-                    all_proxies = []
-                    
-                    # 处理订阅链接
-                    if subscription_urls:
-                        urls = [url.strip() for url in subscription_urls.split('\n') if url.strip()]
-                        for url in urls:
-                            st.info(f"正在处理订阅: {url}")
-                            proxies = sub_manager.fetch_and_parse(url)
-                            st.success(f"从订阅获取到 {len(proxies)} 个节点")
-                            all_proxies.extend(proxies)
-                            
-                            # 按来源分组保存
-                            if url not in st.session_state.proxies_by_source:
-                                st.session_state.proxies_by_source[url] = []
-                            st.session_state.proxies_by_source[url].extend(proxies)
-                    
-                    # 处理直连节点
-                    if direct_nodes:
-                        nodes = [node.strip() for node in direct_nodes.split('\n') if node.strip()]
-                        direct_proxies = []
-                        
-                        for node_str in nodes:
-                            proxy = parse_proxy(node_str)
-                            if proxy:
-                                # 添加来源信息
-                                proxy['_source'] = 'direct'
-                                direct_proxies.append(proxy)
-                                all_proxies.append(proxy)
-                                logger.info(f"成功解析直连节点: {proxy['name']}")
-                            else:
-                                st.warning(f"无法解析节点: {node_str[:30]}...")
-                        
-                        # 按来源分组保存直连节点
-                        if direct_proxies:
-                            st.session_state.proxies_by_source['direct'] = direct_proxies
-                    
-                    # 处理上传的文件
-                    if uploaded_file:
-                        content = uploaded_file.getvalue().decode('utf-8')
-                        nodes = [node.strip() for node in content.split('\n') if node.strip() and not node.startswith('#')]
-                        file_proxies = []
-                        
-                        for node_str in nodes:
-                            proxy = parse_proxy(node_str)
-                            if proxy:
-                                # 添加来源信息
-                                proxy['_source'] = f'file:{uploaded_file.name}'
-                                file_proxies.append(proxy)
-                                all_proxies.append(proxy)
-                                logger.info(f"成功解析文件中的节点: {proxy['name']}")
-                            else:
-                                logger.warning(f"无法解析文件中的节点: {node_str[:30]}...")
-                        
-                        # 按来源分组保存上传文件的节点
-                        if file_proxies:
-                            file_source = f'file:{uploaded_file.name}'
-                            st.session_state.proxies_by_source[file_source] = file_proxies
-                            
-                        st.success(f"从文件中解析了 {len(nodes)} 个节点，成功 {len(file_proxies)} 个")
-                    
-                    # 检查是否有有效节点
-                    if not all_proxies:
-                        st.error("没有找到有效的代理节点，请检查输入")
-                        return
-                    
-                    # 保存节点到会话状态
-                    st.session_state.all_proxies = all_proxies
-                    st.session_state.nodes_loaded = True
-                    
-                    # 初始化端口映射字典
-                    node_mappings = {}
-                    if enable_port_mapping:
-                        # 为节点分配建议的端口值，用户可以稍后修改
-                        port = st.session_state.start_mapping_port
-                        for proxy in all_proxies:
-                            node_mappings[proxy['name']] = {"enabled": False, "port": port}
-                            port += 1
-                    
-                    st.session_state.node_mappings = node_mappings
-                    
-                    st.success(f"成功加载 {len(all_proxies)} 个节点，可以继续配置端口映射。")
-                    
-                except Exception as e:
-                    st.error(f"加载节点时出错: {str(e)}")
-        
-        # 显示节点表格和端口映射配置（如果节点已加载）
-        if st.session_state.nodes_loaded and st.session_state.enable_port_mapping:
-            st.subheader("节点端口映射配置")
-            st.markdown("为需要进行端口映射的节点配置端口。只有启用的节点会创建端口映射。")
-            
-            # 创建一个表单用于配置节点端口映射
-            with st.form("port_mapping_form"):
-                # 获取分组后的节点
-                proxies_by_source = st.session_state.proxies_by_source
-                all_proxies = st.session_state.all_proxies
-                
-                # 设置起始端口
-                start_port = st.number_input(
-                    "端口映射起始值", 
+            st.button("添加节点", type="primary", use_container_width=True, on_click=add_multiple_nodes)
+
+    # --- Column 3: Settings & Actions ---
+    with col3:
+        st.header("🚀 设置与生成")
+        with st.container(border=True):
+            st.subheader("端口映射")
+            st.checkbox("启用多端口映射", key='enable_port_mapping')
+            if st.session_state.enable_port_mapping:
+                st.number_input(
+                    "起始端口",
                     value=st.session_state.start_mapping_port,
-                    min_value=1000,
+                    key='start_mapping_port',
+                    min_value=1025,
                     max_value=65000,
-                    help="设置端口映射的起始值，选中的节点将从此端口开始分配"
+                    on_change=update_node_ports
                 )
-                
-                # 更新会话状态中的起始端口
-                st.session_state.start_mapping_port = start_port
-                
-                # 初始化更新后的映射
-                updated_mappings = {}
-                node_index = 0  # 用于生成唯一的键
-                
-                # 遍历每个订阅源
-                for source, proxies in proxies_by_source.items():
-                    if not proxies:
-                        continue
-                        
-                    # 显示订阅源标题
-                    source_display = source
-                    if source == 'direct':
-                        source_display = '直连节点'
-                    elif source.startswith('file:'):
-                        source_display = f'文件: {source[5:]}'
-                        
-                    st.markdown(f"### {source_display} ({len(proxies)}个)")
-                    
-                    # 添加全选按钮
-                    source_key = f"source_{source.replace(':', '_')}"
-                    
-                    # 获取当前全选状态
-                    if source_key not in st.session_state.source_all_selected:
-                        st.session_state.source_all_selected[source_key] = False
-                    
-                    # 显示全选复选框 - 移除on_change参数
-                    all_enabled = st.checkbox(
-                        f"全选此来源的节点", 
-                        value=st.session_state.source_all_selected[source_key],
-                        key=f"all_{source_key}"
-                    )
-                    
-                    # 检测全选状态变化
-                    if all_enabled != st.session_state.source_all_selected[source_key]:
-                        # 更新全选状态
-                        st.session_state.source_all_selected[source_key] = all_enabled
-                        
-                        # 同步更新所有节点状态到会话状态
+
+                # 确认端口映射复选框
+                st.checkbox(
+                    "确认端口映射",
+                    key='port_mapping_confirmed',
+                    on_change=validate_and_confirm_ports,
+                    help="勾选以验证所有端口配置，验证通过后才能生成配置文件"
+                )
+
+                # 端口冲突检查和自动修复
+                has_conflicts, conflicts = check_port_conflicts()
+                if has_conflicts:
+                    st.warning(f"⚠️ 检测到 {len(conflicts)} 个端口冲突")
+                    with st.expander("查看冲突详情", expanded=True):
+                        for port, nodes in conflicts:
+                            st.error(f"**端口 {port}** 被以下节点共用:")
+                            for node in nodes:
+                                st.text(f"  • {node[:40]}{'...' if len(node) > 40 else ''}")
+
+                    # 自动修复按钮
+                    if st.button("🔧 自动修复端口冲突", use_container_width=True, type="secondary"):
+                        auto_fix_port_conflicts()
+                        st.success("✅ 端口冲突已自动修正！")
+                        st.rerun()
+                else:
+                    # 检查是否已确认端口映射
+                    enabled_count = sum(1 for m in st.session_state.node_mappings.values() if m.get('enabled'))
+                    if enabled_count > 0:
+                        if st.session_state.get('port_mapping_confirmed', False):
+                            # 已确认且无冲突
+                            st.success(f"✅ 所有 {enabled_count} 个端口均无冲突")
+                        else:
+                            # 未确认
+                            st.info(f"ℹ️ 请勾选上方的「确认端口映射」以验证 {enabled_count} 个端口配置")
+
+        with st.container(border=True):
+            st.subheader("生成配置文件")
+            # 使用东八区（北京时间）
+            beijing_tz = timezone(timedelta(hours=8))
+            beijing_time = datetime.now(beijing_tz)
+            output_filename = st.text_input("输出文件名", value=f"config_{beijing_time.strftime('%Y%m%d_%H%M')}.yaml")
+
+            if st.button("生成配置文件", type="primary", use_container_width=True):
+                template_path = st.session_state.selected_template
+                if not template_path and not st.session_state.custom_template_content:
+                    st.error("请先选择或上传一个模板文件！")
+                else:
+                    # 检查端口映射确认状态
+                    if st.session_state.enable_port_mapping:
+                        if not st.session_state.get('port_mapping_confirmed', False):
+                            st.error("❌ 请先勾选上方的「确认端口映射」以验证所有端口配置！")
+                            logger.error("生成配置失败: 端口映射未确认")
+                        else:
+                            # 已确认，继续生成
+                            generate_config_file(template_path, output_filename)
+                    else:
+                        # 未启用端口映射，直接生成
+                        generate_config_file(template_path, output_filename)
+
+    # --- Column 2: Node Configuration ---
+    with col2:
+        st.header("⚙️ 节点列表")
+        if not st.session_state.nodes_loaded:
+            st.info("请从左侧加载节点以查看列表。")
+        else:
+            total_nodes = len(st.session_state.all_proxies)
+            mapped_nodes = sum(1 for m in st.session_state.node_mappings.values() if m.get('enabled'))
+            c1, c2 = st.columns(2)
+            c1.metric("总节点数", f"{total_nodes} 个")
+            c2.metric("已映射端口", f"{mapped_nodes} 个" if st.session_state.enable_port_mapping else "-")
+
+            st.info("点击订阅源可展开/折叠节点列表：")
+
+            # Consume the collapse flag, and set the default state
+            force_collapse = st.session_state.pop('force_collapse', False)
+            default_expanded_state = not force_collapse
+
+            for source, proxies in st.session_state.proxies_by_source.items():
+                if not proxies:
+                    continue
+
+                expander_title = f"源: {source} ({len(proxies)}个节点)"
+                with st.expander(expander_title, expanded=default_expanded_state):
+                    source_key = re.sub(r'[^a-zA-Z0-9]', '_', source)
+
+                    if st.session_state.enable_port_mapping:
+                        # 在渲染全选checkbox之前，根据所有单个节点状态初始化全选checkbox的state
+                        all_checkbox_key = f"all_{source_key}"
+                        if all_checkbox_key not in st.session_state:
+                            # 首次初始化为False
+                            st.session_state[all_checkbox_key] = False
+                        else:
+                            # 如果已存在，根据当前所有节点状态更新（在widget创建前更新是允许的）
+                            all_enabled = all(st.session_state.node_mappings.get(p['name'], {}).get('enabled', False) for p in proxies)
+                            st.session_state[all_checkbox_key] = all_enabled
+
+                        st.checkbox(
+                            "全选/取消全选",
+                            key=all_checkbox_key,
+                            on_change=toggle_all_nodes,
+                            kwargs={'source_key': source_key, 'proxies': proxies}
+                        )
+                        st.markdown("---")
+
                         for proxy in proxies:
                             node_name = proxy['name']
-                            if node_name in st.session_state.node_mappings:
-                                # 将节点状态与全选状态同步
-                                st.session_state.node_mappings[node_name]["enabled"] = all_enabled
-                                
-                                # 同时更新updated_mappings，确保表单提交时状态一致
-                                if node_name in updated_mappings:
-                                    updated_mappings[node_name]["enabled"] = all_enabled
-                    
-                    # 创建折叠区域来展示节点
-                    with st.expander(f"展开查看 {source_display} 的所有节点", expanded=False):
-                        # 使用单行布局展示节点，每行一个节点卡片
-                        for i, proxy in enumerate(proxies):
-                            node_name = proxy['name']
-                            
-                            # 获取当前节点的映射配置
-                            node_mapping = st.session_state.node_mappings.get(node_name, {
-                                "enabled": False, 
-                                "port": start_port + node_index
-                            })
-                            
-                            # 如果全选状态被激活，同步到节点状态
-                            if all_enabled and not node_mapping["enabled"]:
-                                node_mapping["enabled"] = True
-                            
-                            # 使用单行布局，创建一个节点卡片
-                            with st.container():
-                                col1, col2, col3 = st.columns([2, 5, 3])
-                                
-                                with col1:
-                                    st.markdown('<div class="node-cell">', unsafe_allow_html=True)
-                                    enabled = st.checkbox(
-                                        "启用", 
-                                        value=node_mapping["enabled"],
-                                        key=f"enable_{node_index}"
-                                    )
-                                    st.markdown('</div>', unsafe_allow_html=True)
-                                
-                                with col2:
-                                    st.markdown('<div class="node-cell">', unsafe_allow_html=True)
-                                    st.markdown(f"**{node_name}**")
-                                    st.markdown('</div>', unsafe_allow_html=True)
-                                
-                                with col3:
-                                    st.markdown('<div class="node-cell">', unsafe_allow_html=True)
-                                    # 只有在启用时才显示端口输入框
-                                    if enabled:
-                                        port = st.number_input(
-                                            f"端口", 
-                                            value=node_mapping["port"], 
-                                            min_value=1, 
-                                            max_value=65535, 
-                                            key=f"port_{node_index}"
-                                        )
-                                    else:
-                                        port = node_mapping["port"]
-                                    st.markdown('</div>', unsafe_allow_html=True)
-                            
-                            # 添加分隔线，使节点之间视觉上分离
-                            st.markdown('<hr style="margin: 3px 0; border: 0; border-top: 1px solid #eee;">', unsafe_allow_html=True)
-                            
-                            # 更新映射配置
-                            updated_mappings[node_name] = {"enabled": enabled, "port": port}
-                            node_index += 1
-                    
-                    # 添加小节间的分隔线
-                    st.markdown("---")
-                
-                # 提交按钮
-                submitted = st.form_submit_button("保存端口映射配置")
-                if submitted:
-                    # 同步全选状态到节点状态
-                    for source, proxies in proxies_by_source.items():
-                        source_key = f"source_{source.replace(':', '_')}"
-                        if source_key in st.session_state.source_all_selected and st.session_state.source_all_selected[source_key]:
-                            # 如果此来源被全选，确保所有节点都被启用
-                            for proxy in proxies:
-                                node_name = proxy['name']
-                                if node_name in updated_mappings:
-                                    updated_mappings[node_name]["enabled"] = True
-                    
-                    # 更新会话状态中的端口映射配置
-                    st.session_state.node_mappings = updated_mappings
-                    
-                    # 创建折叠日志区域
-                    with st.expander("操作日志", expanded=False):
-                        st.success("端口映射配置已保存！")
-                        
-                        # 计算已启用的端口映射总数
-                        enabled_count = sum(1 for mapping in updated_mappings.values() if mapping.get("enabled", False))
-                        st.info(f"共有 {len(updated_mappings)} 个节点，其中已启用 {enabled_count} 个端口映射")
-                        
-                        # 显示详细信息
-                        if enabled_count > 0:
-                            st.subheader("已启用的端口映射")
-                            listener_type = st.session_state.listener_type if 'listener_type' in st.session_state else 'mixed'
-                            for name, mapping in updated_mappings.items():
-                                if mapping.get("enabled", False):
-                                    st.text(f"- {name} → {listener_type.capitalize()}:{mapping['port']}")
-            
-            # 移除重复的端口映射摘要，改为在表单外简单显示总数
-            enabled_mappings = {name: mapping for name, mapping in st.session_state.node_mappings.items() if mapping["enabled"]}
-            if enabled_mappings:
-                st.success(f"已成功配置 {len(enabled_mappings)} 个节点的端口映射")
-                # 添加查看提示
-                st.info("点击上方的「操作日志」可查看详细的端口映射信息")
-        
-        st.markdown("---")
-        st.markdown("点击下方按钮生成并下载配置文件")
-        
-        if st.button("生成配置", type="primary"):
-            with st.spinner("正在生成配置..."):
-                try:
-                    # 初始化组件
-                    sub_manager = SubscriptionManager()
-                    config_generator = ClashConfigGenerator()
-                    
-                    # 更新基本配置
-                    config_generator.update_basic_config(
-                        port=port,
-                        mixed_port=mixed_port
-                    )
-                    
-                    # 使用已加载的节点或重新加载
-                    all_proxies = []
-                    
-                    # 创建一个折叠日志区域
-                    log_expander = st.expander("生成配置日志", expanded=False)
-                    
-                    with log_expander:
-                        if st.session_state.nodes_loaded:
-                            all_proxies = st.session_state.all_proxies
-                            st.info(f"使用已加载的 {len(all_proxies)} 个节点")
-                        else:
-                            # 收集所有节点
-                            # 处理订阅链接
-                            if subscription_urls:
-                                urls = [url.strip() for url in subscription_urls.split('\n') if url.strip()]
-                                for url in urls:
-                                    st.info(f"正在处理订阅: {url}")
-                                    proxies = sub_manager.fetch_and_parse(url)
-                                    st.success(f"从订阅获取到 {len(proxies)} 个节点")
-                                    all_proxies.extend(proxies)
-                            
-                            # 处理直连节点
-                            if direct_nodes:
-                                nodes = [node.strip() for node in direct_nodes.split('\n') if node.strip()]
-                                for node_str in nodes:
-                                    proxy = parse_proxy(node_str)
-                                    if proxy:
-                                        all_proxies.append(proxy)
-                                        logger.info(f"成功解析直连节点: {proxy['name']}")
-                                    else:
-                                        st.warning(f"无法解析节点: {node_str[:30]}...")
-                            
-                            # 处理上传的文件
-                            if uploaded_file:
-                                content = uploaded_file.getvalue().decode('utf-8')
-                                nodes = [node.strip() for node in content.split('\n') if node.strip() and not node.startswith('#')]
-                                for node_str in nodes:
-                                    proxy = parse_proxy(node_str)
-                                    if proxy:
-                                        all_proxies.append(proxy)
-                                        logger.info(f"成功解析文件中的节点: {proxy['name']}")
-                                    else:
-                                        logger.warning(f"无法解析文件中的节点: {node_str[:30]}...")
-                                st.success(f"从文件中解析了 {len(nodes)} 个节点")
-                    
-                    # 检查是否有有效节点
-                    if not all_proxies:
-                        st.error("没有找到有效的代理节点，请检查输入")
-                        return
-                    
-                    # 更新代理列表
-                    config_generator.update_proxies(all_proxies)
-                    config_generator.update_enabled_proxies(all_proxies)
-                    
-                    # 使用模板路径（如果有）
-                    if st.session_state.template_path and os.path.exists(st.session_state.template_path):
-                        template_content = load_local_file(st.session_state.template_path)
-                        if template_content:
-                            config_generator.update_from_template(template_content)
-                            with log_expander:
-                                st.info(f"已应用模板: {st.session_state.template_path}")
-                    
-                    # 处理端口映射
-                    if st.session_state.enable_port_mapping and st.session_state.nodes_loaded:
-                        # 如果用户已经配置了端口映射，使用用户的配置
-                        if st.session_state.node_mappings:
-                            # 获取监听器类型
-                            listener_type = st.session_state.listener_type if 'listener_type' in st.session_state else 'mixed'
-                            
-                            # 转换为node_port_mappings格式
-                            node_port_mappings = {}
-                            for node_name, mapping in st.session_state.node_mappings.items():
-                                if mapping.get("enabled", False):
-                                    node_port_mappings[node_name] = mapping["port"]
-                            
-                            config_generator.generate_port_mappings(node_port_mappings, listener_type=listener_type)
-                            
-                            # 显示已启用的端口映射信息
-                            if node_port_mappings:
-                                with log_expander:
-                                    st.subheader(f"使用以下端口映射 (类型: {listener_type})")
-                                    for name, port in node_port_mappings.items():
-                                        st.text(f"{name} → {listener_type.capitalize()}:{port}")
-                    
-                    # 生成配置
-                    with log_expander:
-                        st.info(f"共有 {len(all_proxies)} 个节点，开始生成配置")
-                    
-                    # 生成配置
-                    config_yaml = config_generator.generate_full_config()
-                    
-                    # 创建临时文件
-                    with NamedTemporaryFile(suffix='.yaml', delete=False) as temp_file:
-                        temp_path = temp_file.name
-                        with open(temp_path, 'w', encoding='utf-8') as f:
-                            f.write(config_yaml)
-                    
-                    # 创建下载链接
-                    st.markdown(get_download_link(temp_path, output_file), unsafe_allow_html=True)
-                    st.success("配置生成完成!")
-                    
-                    # 可选：保存配置到本地目录
-                    save_local = st.checkbox("同时保存配置到本地目录", value=True)
-                    if save_local:
-                        local_filename = f"local_config_{datetime.now().strftime('%y-%m-%d')}.yaml"
-                        local_path = os.path.join(CONFIG_DIR, local_filename)
-                        with open(local_path, 'w', encoding='utf-8') as f:
-                            f.write(config_yaml)
-                        with log_expander:
-                            st.success(f"配置已保存到本地: {local_path}")
-                    
-                    # 删除临时文件
-                    try:
-                        os.unlink(temp_path)
-                    except:
-                        pass
-                    
-                except Exception as e:
-                    st.error(f"生成配置时出错: {str(e)}")
-                    with st.expander("错误详情", expanded=True):
-                        import traceback
-                        st.error(traceback.format_exc())
+                            node_mapping = st.session_state.node_mappings.get(node_name)
+                            if not node_mapping:
+                                continue
+
+                            # 初始化checkbox的session state（如果不存在）
+                            checkbox_key = f"enable_{node_name}"
+                            if checkbox_key not in st.session_state:
+                                st.session_state[checkbox_key] = node_mapping["enabled"]
+
+                            c1, c2, c3 = st.columns([1, 5, 3])
+                            # 移除value参数，只使用key参数，避免Streamlit警告
+                            enabled = c1.checkbox(" ", key=checkbox_key, label_visibility="collapsed")
+
+                            # 检查状态是否改变
+                            if enabled != node_mapping['enabled']:
+                                # 更新 node_mappings
+                                st.session_state.node_mappings[node_name]['enabled'] = enabled
+                                st.rerun()
+
+                            with c2.expander(node_name):
+                                display_proxy_details(proxy)
+
+                            if enabled:
+                                # 端口输入框（修改端口时自动取消确认状态）
+                                c3.number_input(
+                                    "端口",
+                                    value=node_mapping["port"],
+                                    key=f"port_{node_name}",
+                                    label_visibility="collapsed",
+                                    min_value=1025,
+                                    max_value=65535,
+                                    on_change=on_port_change
+                                )
+                    else:
+                        for proxy in proxies:
+                            with st.expander(proxy['name']):
+                                display_proxy_details(proxy)
+
+def generate_config_file(template_path, output_filename):
+    """生成配置文件的实际逻辑（提取为独立函数）"""
+    temp_template_path = None
+    try:
+        with st.spinner("正在生成配置..."):
+            if st.session_state.custom_template_content:
+                temp_template_path = "temp_template.yaml"
+                with open(temp_template_path, "w", encoding="utf-8") as f:
+                    f.write(st.session_state.custom_template_content)
+                template_path = temp_template_path
+
+            config_generator = ClashConfigGenerator(template_path=template_path)
+
+            # 将解析出的节点静态注入到 proxies 列表
+            if st.session_state.all_proxies:
+                config_generator.add_proxies(st.session_state.all_proxies)
+
+            # 处理端口映射
+            if st.session_state.enable_port_mapping:
+                enabled_mappings = {name: mapping["port"] for name, mapping in st.session_state.node_mappings.items() if mapping.get("enabled")}
+                if enabled_mappings:
+                    config_generator.generate_port_mappings(enabled_mappings)
+
+            config_yaml = config_generator.generate_full_config()
+            st.success("🎉 配置生成成功！")
+            st.download_button("点击下载配置文件", config_yaml, output_filename, 'text/yaml', use_container_width=True)
+
+            with st.expander("查看生成的配置预览", expanded=False):
+                st.code(config_yaml, language='yaml')
+
+    except Exception as e:
+        logger.error("Failed to generate config file.", exc_info=True)
+        st.error(f"生成配置时出错: {e}")
+    finally:
+        if temp_template_path and os.path.exists(temp_template_path):
+            os.remove(temp_template_path)
+            logger.info(f"已清理临时模板文件: {temp_template_path}")
 
 if __name__ == "__main__":
     main()

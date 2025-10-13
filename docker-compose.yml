@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  config-generator:
+    build: .
+    container_name: create_clash_yaml
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./local_configs:/app/local_configs
+    restart: unless-stopped
