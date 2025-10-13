@@ -48,8 +48,8 @@
 1. 克隆仓库
 
 ```bash
-git clone https://github.com/XGCoder/Config_Merge_Shunt.git
-cd Config_Merge_Shunt
+git clone https://github.com/XGCoder/create_clash_yaml.git
+cd create_clash_yaml
 ```
 
 2. 使用 Docker Compose 启动
@@ -73,8 +73,8 @@ docker-compose down
 1. 克隆仓库
 
 ```bash
-git clone https://github.com/XGCoder/Config_Merge_Shunt.git
-cd Config_Merge_Shunt
+git clone https://github.com/XGCoder/create_clash_yaml.git
+cd create_clash_yaml
 ```
 
 2. 安装依赖
