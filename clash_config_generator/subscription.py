@@ -342,11 +342,11 @@ class SubscriptionManager:
                 logger.warning(f"解析行出错: {str(e)}, 行内容: {line[:30]}...")
         
         logger.info(f"按行解析完成，成功解析 {parsed_count} 个节点")
-        
+
         # 对节点的name字段做处理，确保唯一性
         if proxies:
             self._ensure_unique_names(proxies)
-            
+
         return proxies
     
     def _ensure_unique_names(self, proxies):
@@ -435,7 +435,8 @@ class SubscriptionManager:
             return []
         
         logger.info(f"成功获取订阅内容，长度: {len(content)}")
-        logger.info(f"订阅内容开头片段: {content[:100].replace('\n', ' ')}...")
+        content_preview = content[:100].replace('\n', ' ')
+        logger.info(f"订阅内容开头片段: {content_preview}...")
         
         # 解析订阅
         proxies = self.parse_subscription(content)

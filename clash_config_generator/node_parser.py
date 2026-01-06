@@ -7,6 +7,130 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 logger = logging.getLogger(__name__)
 
+def validate_reality_public_key(public_key):
+    """
+    验证 REALITY 协议的 public-key 格式
+
+    Args:
+        public_key (str): public-key 值
+
+    Returns:
+        bool: 是否有效
+    """
+    if not public_key:
+        return False
+
+    # REALITY public-key 应该是标准的 Base64 编码字符串
+    # 有效的 Base64 字符集: A-Z, a-z, 0-9, +, /,-, _
+    # 长度通常为 43 个字符（32字节编码后）
+
+    # 检查长度（通常为 43 或 44 字符）
+    if len(public_key) < 40 or len(public_key) > 50:
+        logger.debug(f"REALITY public-key 长度异常: {len(public_key)} 字符")
+        return False
+
+    # 检查是否只包含有效的Base64 字符
+    if not re.match(r'^[A-Za-z0-9+/\-_]+={0,2}$', public_key):
+        logger.debug(f"REALITY public-key 包含无效字符")
+        return False
+
+    # 排除以纯数字开头的 public-key（容易被误解析为 short-id）
+    # 例如: 0Ykahutes0212... 中的 "0" 开头可能导致 Clash 误将其解析为包含 short-id
+    if re.match(r'^[0-9]', public_key):
+        logger.warning(f"REALITY public-key 以数字开头，可能导致 Clash 解析错误: {public_key[:20]}...")
+        return False
+
+    return True
+
+def validate_reality_short_id(short_id):
+    """
+    验证 REALITY 协议的 short-id 格式
+
+    Args:
+        short_id: short-id 值（可能是字符串或数字）
+
+    Returns:
+        bool: 是否有效
+    """
+    if short_id is None:
+        return True  # short-id 是可选的
+
+    # 转换为字符串
+    short_id_str = str(short_id)
+
+    # short-id 必须是有效的十六进制字符串，长度 2-16 字符
+    if not re.match(r'^[0-9a-fA-F]{2,16}$', short_id_str):
+        logger.warning(f"REALITY short-id 格式无效: {short_id_str}")
+        return False
+
+    # 检查是否可能被 YAML 误解析为科学计数法（如 2e81, 3e10 等）
+    # 这些值在 YAML 中会被解析为浮点数
+    if re.match(r'^[0-9]+[eE][0-9]+$', short_id_str):
+        logger.warning(f"REALITY short-id 可能被 YAML 误解析为科学计数法: {short_id_str}")
+        return False
+
+    return True
+
+def validate_reality_node(proxy):
+    """
+    验证 REALITY 节点的完整性和有效性
+
+    Args:
+        proxy (dict): 代理节点配置
+
+    Returns:
+        bool: 节点是否有效
+    """
+    if not isinstance(proxy, dict):
+        return True  # 非字典类型，跳过验证
+
+    # 检查是否是 REALITY 节点
+    reality_opts = proxy.get('reality-opts')
+    if not reality_opts:
+        return True  # 不是 REALITY 节点，跳过验证
+
+    # 验证 public-key
+    public_key = reality_opts.get('public-key')
+    if not validate_reality_public_key(public_key):
+        logger.warning(f"REALITY 节点 '{proxy.get('name', 'unknown')}' 的 public-key 无效")
+        return False
+
+    # 验证 short-id
+    short_id = reality_opts.get('short-id')
+    if not validate_reality_short_id(short_id):
+        logger.warning(f"REALITY 节点 '{proxy.get('name', 'unknown')}' 的 short-id 无效")
+        return False
+
+    return True
+
+def filter_invalid_reality_nodes(proxies):
+    """
+    过滤掉无效的 REALITY 节点
+
+    Args:
+        proxies (list): 代理节点列表
+
+    Returns:
+        list: 过滤后的有效节点列表
+    """
+    if not proxies:
+        return proxies
+
+    valid_proxies = []
+    filtered_count = 0
+
+    for proxy in proxies:
+        if validate_reality_node(proxy):
+            valid_proxies.append(proxy)
+        else:
+            filtered_count += 1
+            logger.info(f"已过滤无效 REALITY 节点: {proxy.get('name', 'unknown')}")
+
+    if filtered_count > 0:
+        logger.warning(f"共过滤 {filtered_count} 个无效 REALITY 节点")
+
+    return valid_proxies
+
 def decode_base64(encoded_str):
     """
     解码Base64字符串，处理可能的padding问题
@@ -124,20 +248,26 @@ class NodeParser:
                 clash_config['tls'] = True # REALITY requires tls: true
                 clash_config['servername'] = params.get('sni', [server])[0]
                 clash_config['client-fingerprint'] = params.get('fp', ['chrome'])[0]
-                
+
                 public_key = params.get('pbk', [None])[0]
                 short_id = params.get('sid', [None])[0]
-                
+
                 if not public_key:
                     logger.error(f"VLESS REALITY node missing public key (pbk): {vless_uri}")
                     return None
-                
+
+                # 验证 public-key 格式，过滤掉可能导致 Clash 解析错误的节点
+                if not validate_reality_public_key(public_key):
+                    logger.warning(f"VLESS REALITY 节点的 public-key 格式无效，已跳过: {name}")
+                    logger.debug(f"无效的 public-key: {public_key}")
+                    return None
+
                 clash_config['reality-opts'] = {
                     'public-key': public_key
                 }
                 if short_id:
                     clash_config['reality-opts']['short-id'] = short_id
-                
+
                 # flow
                 flow = params.get('flow', [None])[0]
                 if flow:

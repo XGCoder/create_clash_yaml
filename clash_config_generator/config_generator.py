@@ -87,9 +87,14 @@ class ClashConfigGenerator:
         final_yaml_parts = []
 
         # This serializer is for flow-style sections ONLY.
-        def flow_serializer(data):
+        def flow_serializer(data, key=None):
             if data is None: return 'null'
             if isinstance(data, bool): return 'true' if data else 'false'
+            # REALITY 协议特殊字段必须加引号，避免 YAML 误解析
+            # 必须在 int/float 检查之前处理，因为 YAML 可能已将 2e81 解析为浮点数
+            if key in ('public-key', 'short-id'):
+                escaped_data = str(data).replace("'", "''")
+                return f"'{escaped_data}'"
             if isinstance(data, (int, float)): return str(data)
             if isinstance(data, str):
                 # 空字符串必须用引号,否则在flow-style中会被省略
@@ -102,6 +107,7 @@ class ClashConfigGenerator:
                 # 2. 以#开头(注释符)
                 # 3. 是YAML保留字
                 # 4. 包含YAML特殊语法字符: {}[]、&*|>!%
+                # 5. 可能被解析为科学计数法的字符串 (如 2e81, 3e10)
                 # 注意:
                 # - 连字符-、点号.、下划线_在值中是安全的,不需要加引号
                 # - 空格在flow-style上下文中是安全的,不需要加引号
@@ -109,15 +115,16 @@ class ClashConfigGenerator:
 
                 needs_quotes = (
                     bool(re.search(r'[:\{\}\[\],&*|>!%]|^#', data)) or
-                    data in ('true', 'false', 'null', 'yes', 'no', 'on', 'off')
+                    data in ('true', 'false', 'null', 'yes', 'no', 'on', 'off') or
+                    bool(re.match(r'^[0-9]+[eE][0-9]+$', data))  # 科学计数法格式
                 )
                 if needs_quotes:
                     escaped_data = data.replace("'", "''")
                     return f"'{escaped_data}'"
                 return data
             if isinstance(data, dict):
-                # DO NOT quote keys, only values.
-                items = [f"{k}: {flow_serializer(v)}" for k, v in data.items()]
+                # 传递 key 给嵌套值，以便正确处理 reality-opts 中的字段
+                items = [f"{k}: {flow_serializer(v, k)}" for k, v in data.items()]
                 return f"{{{', '.join(items)}}}"
             if isinstance(data, list):
                 # This handles lists inside flow-style dicts, e.g., the proxies list in a proxy-group.
