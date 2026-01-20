@@ -443,16 +443,45 @@ class NodeParser:
             # 处理插件
             plugin = params.get('plugin', [None])[0]
             if plugin:
-                clash_config['plugin'] = plugin
-                
                 plugin_opts = {}
-                if 'obfs' in params:
-                    plugin_opts['mode'] = params.get('obfs-type', params.get('obfs', [None]))[0]
-                if 'obfs-host' in params:
-                    plugin_opts['host'] = params['obfs-host'][0]
-                if 'obfs-uri' in params:
-                    plugin_opts['path'] = params['obfs-uri'][0]
-                
+
+                # ========================================
+                # 检测旧格式: simple-obfs;obfs=http;obfs-host=xxx
+                # 转换为新格式: plugin=obfs, plugin-opts={mode:http, host:xxx}
+                # ========================================
+                if ';' in plugin:
+                    # 旧格式解析
+                    plugin_parts = plugin.split(';')
+                    plugin_name = plugin_parts[0]  # simple-obfs
+
+                    # 提取插件名称: simple-obfs -> obfs
+                    if plugin_name.startswith('simple-'):
+                        plugin_name = plugin_name.replace('simple-', '')
+
+                    # 解析分号分隔的参数
+                    for part in plugin_parts[1:]:
+                        if '=' in part:
+                            key, value = part.split('=', 1)
+                            if key == 'obfs':
+                                plugin_opts['mode'] = value
+                            elif key == 'obfs-host':
+                                plugin_opts['host'] = value
+                            elif key == 'obfs-uri':
+                                plugin_opts['path'] = value
+
+                    clash_config['plugin'] = plugin_name
+                else:
+                    # 新格式，直接使用
+                    clash_config['plugin'] = plugin
+
+                    # 从独立参数中提取配置
+                    if 'obfs' in params:
+                        plugin_opts['mode'] = params.get('obfs-type', params.get('obfs', [None]))[0]
+                    if 'obfs-host' in params:
+                        plugin_opts['host'] = params['obfs-host'][0]
+                    if 'obfs-uri' in params:
+                        plugin_opts['path'] = params['obfs-uri'][0]
+
                 if plugin_opts:
                     clash_config['plugin-opts'] = plugin_opts
 
