@@ -41,4 +41,6 @@ local_configs/*.json
 # Temporary files
 *.tmp
 *.temp
-*.bak 
+*.bak
+
+.venv
