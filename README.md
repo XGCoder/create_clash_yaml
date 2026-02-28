@@ -1,6 +1,14 @@
+
+## 本项目不再更新.使用substore已经实现一键自动化
+## 不用再用此项目进行分流. 详情请看 [这里](https://linux.do/t/topic/1559198)
+
+---
+分割线
+---
 # Create Clash Yaml
 
 一个强大、美观、易用的 Clash 配置文件生成工具，采用现代化UI设计，支持多种订阅格式，可自动解析和合并多个节点来源。
+
 
 [![Language](https://img.shields.io/badge/Language-Python-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
